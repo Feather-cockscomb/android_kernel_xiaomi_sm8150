@@ -71,7 +71,13 @@
 #include <linux/pid_namespace.h>
 #include <linux/security.h>
 #include <linux/spinlock.h>
+#include <linux/ratelimit.h>
+#include <linux/syscalls.h>
+#include <linux/task_work.h>
+#include <linux/sizes.h>
 
+#include <uapi/linux/eventpoll.h>
+#include <uapi/linux/sched/types.h>
 #include <uapi/linux/android/binder.h>
 #include <uapi/linux/sched/types.h>
 #include "binder_alloc.h"
@@ -2368,6 +2374,66 @@ static bool binder_validate_fixup(struct binder_proc *proc,
 	return (fixup_offset >= last_min_offset);
 }
 
+/**
+ * struct binder_task_work_cb - for deferred close
+ *
+ * @twork:                callback_head for task work
+ * @fd:                   fd to close
+ *
+ * Structure to pass task work to be handled after
+ * returning from binder_ioctl() via task_work_add().
+ */
+struct binder_task_work_cb {
+	struct callback_head twork;
+	struct file *file;
+};
+
+/**
+ * binder_do_fd_close() - close list of file descriptors
+ * @twork:	callback head for task work
+ *
+ * It is not safe to call ksys_close() during the binder_ioctl()
+ * function if there is a chance that binder's own file descriptor
+ * might be closed. This is to meet the requirements for using
+ * fdget() (see comments for __fget_light()). Therefore use
+ * task_work_add() to schedule the close operation once we have
+ * returned from binder_ioctl(). This function is a callback
+ * for that mechanism and does the actual ksys_close() on the
+ * given file descriptor.
+ */
+static void binder_do_fd_close(struct callback_head *twork)
+{
+	struct binder_task_work_cb *twcb = container_of(twork,
+			struct binder_task_work_cb, twork);
+
+	fput(twcb->file);
+	kfree(twcb);
+}
+
+/**
+ * binder_deferred_fd_close() - schedule a close for the given file-descriptor
+ * @fd:		file-descriptor to close
+ *
+ * See comments in binder_do_fd_close(). This function is used to schedule
+ * a file-descriptor to be closed after returning from binder_ioctl().
+ */
+static void binder_deferred_fd_close(int fd)
+{
+	struct binder_task_work_cb *twcb;
+
+	twcb = kzalloc(sizeof(*twcb), GFP_KERNEL);
+	if (!twcb)
+		return;
+	init_task_work(&twcb->twork, binder_do_fd_close);
+	__close_fd_get_file(fd, &twcb->file);
+	if (twcb->file) {
+		filp_close(twcb->file, current->files);
+		task_work_add(current, &twcb->twork, true);
+	} else {
+		kfree(twcb);
+	}
+}
+
 static void binder_transaction_buffer_release(struct binder_proc *proc,
 					      struct binder_buffer *buffer,
 					      binder_size_t failed_at,
@@ -3086,8 +3152,8 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		e->to_node = target_node->debug_id;
-		if (security_binder_transaction(proc->cred,
-						target_proc->cred) < 0) {
+		if (security_binder_transaction(binder_get_cred(proc),
+					binder_get_cred(target_proc)) < 0) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPERM;
 			return_error_line = __LINE__;
@@ -5223,7 +5289,7 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	hlist_add_head(&proc->proc_node, &binder_procs);
 	mutex_unlock(&binder_procs_lock);
 
-	if (binder_debugfs_dir_entry_proc) {
+	if (binder_debugfs_dir_entry_proc && !existing_pid) {
 		char strbuf[11];
 
 		snprintf(strbuf, sizeof(strbuf), "%u", proc->pid);
